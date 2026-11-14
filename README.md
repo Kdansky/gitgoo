@@ -4,6 +4,8 @@ A git review tool. Pick any two commits, on any two branches, and see everything
 
 Most tools show one commit's changes. gitgoo compares two arbitrary points: skip commits, or put one branch's head against another's.
 
+![gitgoo reviewing its own repo: two commit histories, the files between the picked commits, and Cargo.toml side by side](docs/screenshot.png)
+
 ## Using it
 
 Start the application and pick a repository folder, or run `gitgoo path/to/repo`.
