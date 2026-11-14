@@ -7,6 +7,7 @@ mod diffview;
 mod git;
 mod graph;
 mod picker;
+mod recent;
 
 use std::path::PathBuf;
 

@@ -5,6 +5,7 @@ use eframe::egui::{self, Color32, Sense, TextFormat, TextStyle, vec2};
 use egui::text::{LayoutJob, TextWrapping};
 
 use crate::git::{self, Commit};
+use crate::recent::{self, Ask, Recents};
 use crate::{diff, diffview, graph, picker};
 
 const PAGE: usize = 500;
@@ -34,7 +35,8 @@ enum Load<T> {
     Failed(String),
 }
 
-/// An open repository.
+/// An open repository. Its background work reports on its own channel, so results for a repository since replaced
+/// go nowhere.
 struct Repo {
     path: PathBuf,
     sides: [Side; 2],
@@ -46,11 +48,39 @@ struct Repo {
     shown: Option<((String, String), String)>,
     view: Load<diffview::View>,
     picker: Option<picker::Picker>,
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
+}
+
+/// A background result for an open repository.
+enum Msg {
+    Page { side: usize, branch: String, skip: usize, page: git::Result<Vec<Commit>>, keep: bool },
+    Graph(git::Result<graph::Graph>),
+    Files { pair: (String, String), files: git::Result<Vec<git::Change>> },
+    View { key: ((String, String), String), view: git::Result<diffview::View> },
 }
 
 impl Repo {
+    fn new(path: PathBuf) -> Self {
+        let head = git::head(&path);
+        let side = || Side { branch: head.clone(), commits: Vec::new(), paging: Paging::More, error: None, picked: None };
+        let (tx, rx) = channel();
+        Self {
+            sides: [side(), side()],
+            path,
+            pair: None,
+            files: Load::Waiting,
+            file: None,
+            shown: None,
+            view: Load::Waiting,
+            picker: None,
+            tx,
+            rx,
+        }
+    }
+
     /// Reloads the file list when the picked commits have changed since the last call.
-    fn compare(&mut self, tx: &Sender<Msg>, ctx: &egui::Context) {
+    fn compare(&mut self, ctx: &egui::Context) {
         let pair = self.sides[0].picked.clone().zip(self.sides[1].picked.clone());
         if pair == self.pair {
             return;
@@ -61,7 +91,7 @@ impl Repo {
             return;
         };
         self.files = Load::Loading;
-        let (tx, ctx, repo) = (tx.clone(), ctx.clone(), self.path.clone());
+        let (tx, ctx, repo) = (self.tx.clone(), ctx.clone(), self.path.clone());
         std::thread::spawn(move || {
             let files = git::changes(&repo, &a, &b);
             _ = tx.send(Msg::Files { pair: (a, b), files });
@@ -70,7 +100,7 @@ impl Repo {
     }
 
     /// Reloads columns D and E when the picked file, or the commits it's compared across, changed.
-    fn show_file(&mut self, tx: &Sender<Msg>, ctx: &egui::Context) {
+    fn show_file(&mut self, ctx: &egui::Context) {
         // Until the new list arrives it's unknown whether the picked file still differs.
         let Load::Ready(list) = &self.files else { return };
         let change = self.file.as_ref().and_then(|f| list.iter().find(|c| &c.path == f));
@@ -86,7 +116,7 @@ impl Repo {
         let old = (c.status != 'A').then(|| c.old.clone().unwrap_or_else(|| c.path.clone()));
         let new = (c.status != 'D').then(|| c.path.clone());
         self.view = Load::Loading;
-        let (tx, ctx, repo) = (tx.clone(), ctx.clone(), self.path.clone());
+        let (tx, ctx, repo) = (self.tx.clone(), ctx.clone(), self.path.clone());
         std::thread::spawn(move || {
             let ((a, b), _) = &key;
             let text = |rev: &str, path: &Option<String>| match path {
@@ -107,10 +137,10 @@ impl Repo {
         });
     }
 
-    fn load(&mut self, side: usize, tx: &Sender<Msg>, ctx: &egui::Context) {
+    fn load(&mut self, side: usize, ctx: &egui::Context) {
         let s = &mut self.sides[side];
         s.paging = Paging::Loading;
-        let (tx, ctx, repo, branch, skip) = (tx.clone(), ctx.clone(), self.path.clone(), s.branch.clone(), s.commits.len());
+        let (tx, ctx, repo, branch, skip) = (self.tx.clone(), ctx.clone(), self.path.clone(), s.branch.clone(), s.commits.len());
         let picked = s.picked.clone().filter(|_| skip == 0);
         std::thread::spawn(move || {
             let page = git::log(&repo, &branch, skip, PAGE);
@@ -121,9 +151,9 @@ impl Repo {
         });
     }
 
-    fn pick_branch(&mut self, side: usize, tx: &Sender<Msg>, ctx: &egui::Context) {
+    fn pick_branch(&mut self, side: usize, ctx: &egui::Context) {
         self.picker = Some(picker::Picker::new(side));
-        let (tx, ctx, repo) = (tx.clone(), ctx.clone(), self.path.clone());
+        let (tx, ctx, repo) = (self.tx.clone(), ctx.clone(), self.path.clone());
         std::thread::spawn(move || {
             _ = tx.send(Msg::Graph(graph::load(&repo)));
             ctx.request_repaint();
@@ -137,90 +167,12 @@ impl Repo {
             *s = Side { branch, picked: s.picked.take(), commits: Vec::new(), paging: Paging::More, error: None };
         }
     }
-}
 
-enum Msg {
-    Picked(Option<PathBuf>),
-    Page { side: usize, branch: String, skip: usize, page: git::Result<Vec<Commit>>, keep: bool },
-    Graph(git::Result<graph::Graph>),
-    Files { pair: (String, String), files: git::Result<Vec<git::Change>> },
-    View { key: ((String, String), String), view: git::Result<diffview::View> },
-}
-
-pub struct App {
-    /// None until a repository is open; the start screen shows meanwhile.
-    repo: Option<Repo>,
-    /// Why the last folder didn't open.
-    error: Option<String>,
-    picking: bool,
-    /// How the diff view lays out a diff, whichever file it shows.
-    mode: diff::Mode,
-    tx: Sender<Msg>,
-    rx: Receiver<Msg>,
-}
-
-impl App {
-    /// Opens `dir` if given, else the folder picker: double-clicking the binary passes no arguments.
-    pub fn new(cc: &eframe::CreationContext, dir: Option<PathBuf>) -> Self {
-        let (tx, rx) = channel();
-        let mut app = Self { repo: None, error: None, picking: false, mode: diff::Mode::Full, tx, rx };
-        match dir {
-            Some(dir) => app.open(dir, &cc.egui_ctx),
-            None => app.pick(rfd::AsyncFileDialog::new().set_parent(cc), &cc.egui_ctx),
-        }
-        app
-    }
-
-    /// The dialog is created here on the main thread, as macOS requires, and awaited on a worker so the window keeps
-    /// responding; a blocked window gets greyed out as hung while the user browses.
-    fn pick(&mut self, dialog: rfd::AsyncFileDialog, ctx: &egui::Context) {
-        self.picking = true;
-        let dir = dialog.set_title("Open repository").pick_folder();
-        let (tx, ctx) = (self.tx.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            let dir = pollster::block_on(dir).map(|d| d.path().to_owned());
-            _ = tx.send(Msg::Picked(dir));
-            ctx.request_repaint();
-        });
-    }
-
-    fn open(&mut self, dir: PathBuf, ctx: &egui::Context) {
-        let path = match git::root(&dir) {
-            Ok(path) => path,
-            Err(e) => {
-                self.error = Some(format!("{}\n{}", dir.display(), e.lines().next().unwrap_or_default()));
-                return;
-            }
-        };
-        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — gitgoo")));
-        let head = git::head(&path);
-        let side = || Side { branch: head.clone(), commits: Vec::new(), paging: Paging::More, error: None, picked: None };
-        self.repo = Some(Repo {
-            sides: [side(), side()],
-            path,
-            pair: None,
-            files: Load::Waiting,
-            file: None,
-            shown: None,
-            view: Load::Waiting,
-            picker: None,
-        });
-        self.error = None;
-    }
-
-    fn receive(&mut self, ctx: &egui::Context) {
+    fn receive(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Picked(dir) => {
-                    self.picking = false;
-                    if let Some(dir) = dir {
-                        self.open(dir, ctx);
-                    }
-                }
                 Msg::Page { side, branch, skip, page, keep } => {
-                    let Some(repo) = &mut self.repo else { continue };
-                    let s = &mut repo.sides[side];
+                    let s = &mut self.sides[side];
                     // The column has since switched branch, or this page already arrived.
                     if s.branch != branch || s.commits.len() != skip {
                         continue;
@@ -240,16 +192,15 @@ impl App {
                     }
                 }
                 Msg::Files { pair, files } => {
-                    let Some(repo) = &mut self.repo else { continue };
                     // A later pick superseded this comparison.
-                    if repo.pair.as_ref() != Some(&pair) {
+                    if self.pair.as_ref() != Some(&pair) {
                         continue;
                     }
-                    repo.files = match files {
+                    self.files = match files {
                         Ok(list) => {
                             // Keep the picked file only if it still differs.
-                            if !list.iter().any(|c| repo.file.as_ref() == Some(&c.path)) {
-                                repo.file = None;
+                            if !list.iter().any(|c| self.file.as_ref() == Some(&c.path)) {
+                                self.file = None;
                             }
                             Load::Ready(list)
                         }
@@ -257,14 +208,13 @@ impl App {
                     };
                 }
                 Msg::Graph(graph) => {
-                    if let Some(p) = self.repo.as_mut().and_then(|r| r.picker.as_mut()) {
+                    if let Some(p) = &mut self.picker {
                         p.graph = Some(graph);
                     }
                 }
                 Msg::View { key, view } => {
-                    let Some(repo) = &mut self.repo else { continue };
-                    if repo.shown.as_ref() == Some(&key) {
-                        repo.view = view.map_or_else(Load::Failed, Load::Ready);
+                    if self.shown.as_ref() == Some(&key) {
+                        self.view = view.map_or_else(Load::Failed, Load::Ready);
                     }
                 }
             }
@@ -272,63 +222,191 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        self.receive(ui.ctx());
-        let Some(repo) = &mut self.repo else {
-            egui::CentralPanel::default().show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(ui.available_height() / 3.0);
-                    ui.heading("gitgoo");
-                    ui.add_space(8.0);
-                    if ui.add_enabled(!self.picking, egui::Button::new("Open repository…")).clicked() {
-                        self.pick(rfd::AsyncFileDialog::new().set_parent(frame), ui.ctx());
-                    }
-                    if let Some(e) = &self.error {
-                        ui.add_space(8.0);
-                        ui.colored_label(ui.visuals().error_fg_color, e);
-                    }
-                });
-            });
-            return;
-        };
-        // First, so it spans the window above every column.
-        egui::Panel::top("toolbar").show(ui, |ui| ui.horizontal(|ui| diffview::mode_buttons(ui, &mut self.mode)));
-        let mut ask = None;
-        for (i, id) in ["a", "b"].into_iter().enumerate() {
-            let more = egui::Panel::left(id).resizable(true).default_size(300.0).min_size(120.0).show(ui, |ui| {
-                let s = &mut repo.sides[i];
-                if header(ui, &s.branch).on_hover_text("Pick a branch").clicked() {
-                    ask = Some(i);
-                }
-                ui.separator();
-                history(ui, s)
-            });
-            if more.inner {
-                repo.load(i, &self.tx, ui.ctx());
-            }
+pub struct App {
+    /// None until a repository is open; the start screen shows meanwhile.
+    repo: Option<Repo>,
+    recents: Recents,
+    /// The "Open recent" dialog is up.
+    recent_open: bool,
+    /// The recent list changed, and should reach the disk now rather than at exit.
+    dirty: bool,
+    /// Why the last folder didn't open.
+    error: Option<String>,
+    picking: bool,
+    /// How the diff view lays out a diff, whichever file it shows.
+    mode: diff::Mode,
+    /// Where the folder picker reports.
+    tx: Sender<Option<PathBuf>>,
+    rx: Receiver<Option<PathBuf>>,
+}
+
+impl App {
+    /// Opens `dir` if given, else the folder picker: double-clicking the binary passes no arguments.
+    pub fn new(cc: &eframe::CreationContext, dir: Option<PathBuf>) -> Self {
+        let (tx, rx) = channel();
+        let mode = cc.storage.and_then(|s| eframe::get_value(s, "mode")).unwrap_or(diff::Mode::Full);
+        let recents = Recents::load(cc.storage);
+        let mut app = Self { repo: None, recents, recent_open: false, dirty: false, error: None, picking: false, mode, tx, rx };
+        match dir {
+            Some(dir) => app.open(dir, &cc.egui_ctx),
+            None => app.pick(rfd::AsyncFileDialog::new().set_parent(cc), &cc.egui_ctx),
         }
-        if let Some(i) = ask {
-            repo.pick_branch(i, &self.tx, ui.ctx());
-        }
-        repo.compare(&self.tx, ui.ctx());
-        egui::Panel::left("c").resizable(true).default_size(300.0).min_size(120.0).show(ui, |ui| files(ui, repo));
-        repo.show_file(&self.tx, ui.ctx());
-        egui::CentralPanel::default().show(ui, |ui| match &mut repo.view {
-            Load::Ready(view) => view.show(ui, self.mode),
-            Load::Waiting => drop(ui.weak("Pick a file in C.")),
-            Load::Loading => drop(ui.spinner()),
-            Load::Failed(e) => drop(ui.colored_label(ui.visuals().error_fg_color, e.as_str())),
+        app
+    }
+
+    /// The dialog is created here on the main thread, as macOS requires, and awaited on a worker so the window keeps
+    /// responding; a blocked window gets greyed out as hung while the user browses.
+    fn pick(&mut self, dialog: rfd::AsyncFileDialog, ctx: &egui::Context) {
+        self.picking = true;
+        let dir = dialog.set_title("Open repository").pick_folder();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            _ = tx.send(pollster::block_on(dir).map(|d| d.path().to_owned()));
+            ctx.request_repaint();
         });
-        match repo.picker.as_mut().map(|p| (p.side, p.show(ui.ctx(), &repo.sides[p.side].branch))) {
-            Some((side, picker::Outcome::Picked(branch))) => {
-                repo.picker = None;
-                repo.switch(side, branch);
+    }
+
+    fn open(&mut self, dir: PathBuf, ctx: &egui::Context) {
+        let path = match git::root(&dir) {
+            Ok(path) => path,
+            Err(e) => {
+                self.error = Some(format!("{}\n{}", dir.display(), e.lines().next().unwrap_or_default()));
+                // With a repository open there's no start screen to say so.
+                self.recent_open |= self.repo.is_some();
+                return;
             }
-            Some((_, picker::Outcome::Closed)) => repo.picker = None,
-            _ => {}
+        };
+        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — gitgoo")));
+        self.recents.remember(&path);
+        self.dirty = true;
+        self.repo = Some(Repo::new(path));
+        self.error = None;
+        self.recent_open = false;
+    }
+}
+
+impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.recents.save(storage);
+        eframe::set_value(storage, "mode", &self.mode);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        while let Ok(dir) = self.rx.try_recv() {
+            self.picking = false;
+            if let Some(dir) = dir {
+                self.open(dir, ui.ctx());
+            }
+        }
+        if std::mem::take(&mut self.dirty)
+            && let Some(s) = frame.storage_mut()
+        {
+            eframe::App::save(self, s);
+            s.flush();
+        }
+        let ask = match &mut self.repo {
+            None => start(ui, &self.recents, self.picking, self.error.as_deref()),
+            Some(repo) => {
+                repo.receive();
+                let mut ask = None;
+                // First, so it spans the window above every column.
+                egui::Panel::top("toolbar").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Open recent").clicked() {
+                            ask = Some(Ask::Show);
+                        }
+                        ui.separator();
+                        diffview::mode_buttons(ui, &mut self.mode);
+                    })
+                });
+                let mut branch = None;
+                for (i, id) in ["a", "b"].into_iter().enumerate() {
+                    let more = egui::Panel::left(id).resizable(true).default_size(300.0).min_size(120.0).show(ui, |ui| {
+                        let s = &mut repo.sides[i];
+                        if header(ui, &s.branch).on_hover_text("Pick a branch").clicked() {
+                            branch = Some(i);
+                        }
+                        ui.separator();
+                        history(ui, s)
+                    });
+                    if more.inner {
+                        repo.load(i, ui.ctx());
+                    }
+                }
+                if let Some(i) = branch {
+                    repo.pick_branch(i, ui.ctx());
+                }
+                repo.compare(ui.ctx());
+                egui::Panel::left("c").resizable(true).default_size(300.0).min_size(120.0).show(ui, |ui| files(ui, repo));
+                repo.show_file(ui.ctx());
+                egui::CentralPanel::default().show(ui, |ui| match &mut repo.view {
+                    Load::Ready(view) => view.show(ui, self.mode),
+                    Load::Waiting => drop(ui.weak("Pick a file in C.")),
+                    Load::Loading => drop(ui.spinner()),
+                    Load::Failed(e) => drop(ui.colored_label(ui.visuals().error_fg_color, e.as_str())),
+                });
+                match repo.picker.as_mut().map(|p| (p.side, p.show(ui.ctx(), &repo.sides[p.side].branch))) {
+                    Some((side, picker::Outcome::Picked(branch))) => {
+                        repo.picker = None;
+                        repo.switch(side, branch);
+                    }
+                    Some((_, picker::Outcome::Closed)) => repo.picker = None,
+                    _ => {}
+                }
+                if self.recent_open {
+                    ask = ask.or(recent::dialog(ui.ctx(), &self.recents, Some(&repo.path), self.error.as_deref()));
+                }
+                ask
+            }
+        };
+        match ask {
+            Some(Ask::Show) => {
+                self.recents.check();
+                self.error = None;
+                self.recent_open = true;
+            }
+            Some(Ask::Close) => self.recent_open = false,
+            Some(Ask::Open(path)) => self.open(path, ui.ctx()),
+            Some(Ask::Forget(path)) => {
+                self.recents.forget(&path);
+                self.dirty = true;
+            }
+            Some(Ask::ForgetMissing) => {
+                self.recents.forget_missing();
+                self.dirty = true;
+            }
+            Some(Ask::Browse) => {
+                self.recent_open = false;
+                self.pick(rfd::AsyncFileDialog::new().set_parent(&*frame), ui.ctx());
+            }
+            None => {}
         }
     }
+}
+
+/// The screen before any repository is open.
+fn start(ui: &mut egui::Ui, recents: &Recents, picking: bool, error: Option<&str>) -> Option<Ask> {
+    let mut ask = None;
+    egui::CentralPanel::default().show(ui, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() / 5.0);
+            ui.heading("gitgoo");
+            ui.add_space(8.0);
+            if ui.add_enabled(!picking, egui::Button::new("Open repository…")).clicked() {
+                ask = Some(Ask::Browse);
+            }
+            if let Some(e) = error {
+                ui.add_space(8.0);
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
+            if !recents.is_empty() {
+                ui.add_space(24.0);
+                ask = ask.take().or(recent::list(ui, recents, None));
+            }
+        });
+    });
+    ask
 }
 
 /// The branch name heading a history column, with a triangle saying it opens something. Painted, as egui's fonts
@@ -540,6 +618,37 @@ mod tests {
         h.step();
         assert_eq!(a(&h), None, "a forked before c3");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn open_recent_switches_repositories_and_forgets_missing_ones() {
+        let one = git::tests::repo("ui-recent-one", &["first"]);
+        let two = git::root(&git::tests::repo("ui-recent-two", &["second"])).unwrap();
+        let gone = std::env::temp_dir().join(format!("gitgoo-{}-gone", std::process::id()));
+        let name = |p: &std::path::Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        let mut h = Harness::builder().with_size([1400.0, 600.0]).build_eframe(|cc| App::new(cc, Some(one.clone())));
+        wait(&mut h, |h| h.query_all_by_label("first").count() == 2);
+        // As if opened in earlier runs; one folder has since gone.
+        h.state_mut().recents.remember(&gone);
+        h.state_mut().recents.remember(&two);
+        h.get_by_label("Open recent").click();
+        // A new window is drawn invisibly on its first frame, while egui measures it.
+        h.run_steps(3);
+        shot(&mut h, "recent");
+        h.get_by_label("Forget").click();
+        h.run_steps(2);
+        assert!(h.query_by_label(&name(&gone)).is_none());
+        h.get_by_label(&name(&two)).click();
+        wait(&mut h, |h| h.query_all_by_label("second").count() == 2);
+        assert!(!h.state().recent_open);
+        assert_eq!(h.state().repo.as_ref().map(|r| name(&r.path)), Some(name(&two)));
+        // The start screen lists them too.
+        h.state_mut().repo = None;
+        h.run_steps(2);
+        shot(&mut h, "start");
+        assert!(h.query_by_label(&name(&one)).is_some());
+        std::fs::remove_dir_all(one).unwrap();
+        std::fs::remove_dir_all(two).unwrap();
     }
 
     /// Not a check: renders a real repo's branch picker, and times the graph, for a person to look at.

@@ -16,7 +16,7 @@ Five columns:
 - **C**: files that differ between the commits picked in A and B, with status and +/− line counts. Clickable.
 - **D, E**: the picked file side by side, aligned, scrolling together. The old file is always A's commit, on the left; the new one B's.
 
-A toolbar spans the window above the columns. Its first group switches the diff view between three modes:
+A toolbar spans the window above the columns: "Open recent" leftmost, then a group switching the diff view between three modes:
 
 1. Side by side, the whole file.
 2. Side by side, only the changes and 4 lines around each; the stretches left out show as one "n unchanged lines" row.
@@ -31,6 +31,8 @@ Switching a column's branch keeps its commit if the new branch contains it, and 
 ## Starting
 
 Double-clicking the binary passes no arguments, so gitgoo opens the OS folder picker on a start screen. Any folder inside a repo opens that repo. An argument (`gitgoo path/to/repo`) opens it directly. A folder that isn't a repo leaves the start screen up with git's reason.
+
+gitgoo remembers the last 20 repositories opened, newest first. The start screen lists them, and so does the dialog behind the toolbar's leftmost button, "Open recent", which can also browse for another folder. A repository whose folder has since moved or gone shows as missing, and can only be forgotten; any entry can be. The list lives in eframe's storage (`~/.local/share/gitgoo` on Linux, Application Support on macOS, AppData on Windows), written as soon as it changes. That storage also keeps the diff mode, the window's size and the column widths.
 
 ## Diff semantics
 
@@ -69,6 +71,7 @@ src/
   app.rs        state, layout
   graph.rs      how branches leave and rejoin the trunk; no egui
   picker.rs     draws the branch picker
+  recent.rs     repositories opened before, and their dialog
   git.rs        runs git, parses output; no egui
   diff.rs       aligned rows, word changes; no egui
   highlight.rs  syntect on a worker thread, cached per blob
@@ -77,7 +80,7 @@ src/
 
 `git.rs` and `diff.rs` know nothing of the UI and are tested against throwaway repos. UI tests drive the whole app offscreen with `egui_kittest`, finding rows by their accessibility labels; `GITGOO_SHOTS=folder cargo test` saves what the UI tests see; `GITGOO_REPO=path GITGOO_SHOTS=folder cargo test real_repo -- --ignored` renders a real repo's picker.
 
-Nothing blocks a frame. Git calls and highlighting run on worker threads and send results back; a result tagged with a request the UI has since moved past is dropped.
+Nothing blocks a frame. Git calls and highlighting run on worker threads and send results back; a result tagged with a request the UI has since moved past is dropped. Each open repository has its own channel, so work for one since replaced lands nowhere.
 
 ## Diff view
 

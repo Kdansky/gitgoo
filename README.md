@@ -8,7 +8,7 @@ Most tools show one commit's changes. gitgoo compares two arbitrary points: skip
 
 ## Using it
 
-Start the application and pick a repository folder, or run `gitgoo path/to/repo`.
+Start the application and pick a repository folder, or run `gitgoo path/to/repo`. Repositories opened before are listed on the start screen and behind the toolbar's "Open recent".
 
 - **First and second column**: two commit histories. The branch name above each opens a map of the branches, drawn leaving and rejoining main; click one to switch.
 - **List of files**: the files that differ between the commits picked in A and B, with line counts.

@@ -32,7 +32,7 @@ pub struct Diff {
 }
 
 /// How the diff view lays out a diff.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
     /// Side by side, the whole file.
     Full,
