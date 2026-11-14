@@ -1,0 +1,569 @@
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender, channel};
+
+use eframe::egui::{self, Color32, Sense, TextFormat, TextStyle, vec2};
+use egui::text::{LayoutJob, TextWrapping};
+
+use crate::git::{self, Commit};
+use crate::{diff, diffview, graph, picker};
+
+const PAGE: usize = 500;
+
+#[derive(PartialEq)]
+enum Paging {
+    More,
+    Loading,
+    Done,
+}
+
+/// One history column, A or B.
+struct Side {
+    branch: String,
+    commits: Vec<Commit>,
+    paging: Paging,
+    error: Option<String>,
+    picked: Option<String>,
+}
+
+/// What a background git call fills in.
+enum Load<T> {
+    /// Nothing picked to load.
+    Waiting,
+    Loading,
+    Ready(T),
+    Failed(String),
+}
+
+/// An open repository.
+struct Repo {
+    path: PathBuf,
+    sides: [Side; 2],
+    /// The commits `files` compares: A's pick, B's pick.
+    pair: Option<(String, String)>,
+    files: Load<Vec<git::Change>>,
+    file: Option<String>,
+    /// The commits and path `view` shows.
+    shown: Option<((String, String), String)>,
+    view: Load<diffview::View>,
+    picker: Option<picker::Picker>,
+}
+
+impl Repo {
+    /// Reloads the file list when the picked commits have changed since the last call.
+    fn compare(&mut self, tx: &Sender<Msg>, ctx: &egui::Context) {
+        let pair = self.sides[0].picked.clone().zip(self.sides[1].picked.clone());
+        if pair == self.pair {
+            return;
+        }
+        self.pair = pair.clone();
+        let Some((a, b)) = pair else {
+            self.files = Load::Waiting;
+            return;
+        };
+        self.files = Load::Loading;
+        let (tx, ctx, repo) = (tx.clone(), ctx.clone(), self.path.clone());
+        std::thread::spawn(move || {
+            let files = git::changes(&repo, &a, &b);
+            _ = tx.send(Msg::Files { pair: (a, b), files });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Reloads columns D and E when the picked file, or the commits it's compared across, changed.
+    fn show_file(&mut self, tx: &Sender<Msg>, ctx: &egui::Context) {
+        // Until the new list arrives it's unknown whether the picked file still differs.
+        let Load::Ready(list) = &self.files else { return };
+        let change = self.file.as_ref().and_then(|f| list.iter().find(|c| &c.path == f));
+        let key = self.pair.clone().zip(change.map(|c| c.path.clone()));
+        if key == self.shown {
+            return;
+        }
+        self.shown = key.clone();
+        let (Some(key), Some(c)) = (key, change) else {
+            self.view = Load::Waiting;
+            return;
+        };
+        let old = (c.status != 'A').then(|| c.old.clone().unwrap_or_else(|| c.path.clone()));
+        let new = (c.status != 'D').then(|| c.path.clone());
+        self.view = Load::Loading;
+        let (tx, ctx, repo) = (tx.clone(), ctx.clone(), self.path.clone());
+        std::thread::spawn(move || {
+            let ((a, b), _) = &key;
+            let text = |rev: &str, path: &Option<String>| match path {
+                Some(p) => git::blob(&repo, rev, p).map(diff::text),
+                None => Ok(Some(String::new())),
+            };
+            let title = |rev: &str, path: &Option<String>| match path {
+                Some(p) => format!("{p} @ {}", &rev[..8]),
+                None => format!("(not in {})", &rev[..8]),
+            };
+            let view = match (text(a, &old), text(b, &new)) {
+                (Err(e), _) | (_, Err(e)) => Err(e),
+                (Ok(Some(o)), Ok(Some(n))) => Ok(diffview::View::new(diff::diff(&o, &n), [title(a, &old), title(b, &new)])),
+                _ => Err("binary file not supported".to_owned()),
+            };
+            _ = tx.send(Msg::View { key, view });
+            ctx.request_repaint();
+        });
+    }
+
+    fn load(&mut self, side: usize, tx: &Sender<Msg>, ctx: &egui::Context) {
+        let s = &mut self.sides[side];
+        s.paging = Paging::Loading;
+        let (tx, ctx, repo, branch, skip) = (tx.clone(), ctx.clone(), self.path.clone(), s.branch.clone(), s.commits.len());
+        let picked = s.picked.clone().filter(|_| skip == 0);
+        std::thread::spawn(move || {
+            let page = git::log(&repo, &branch, skip, PAGE);
+            // On a newly picked branch, the column's commit stays picked only if the branch contains it.
+            let keep = picked.is_none_or(|c| git::contains(&repo, &branch, &c));
+            _ = tx.send(Msg::Page { side, branch, skip, page, keep });
+            ctx.request_repaint();
+        });
+    }
+
+    fn pick_branch(&mut self, side: usize, tx: &Sender<Msg>, ctx: &egui::Context) {
+        self.picker = Some(picker::Picker::new(side));
+        let (tx, ctx, repo) = (tx.clone(), ctx.clone(), self.path.clone());
+        std::thread::spawn(move || {
+            _ = tx.send(Msg::Graph(graph::load(&repo)));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Points a history column at another branch. Its pick survives until the first page shows whether it's in there.
+    fn switch(&mut self, side: usize, branch: String) {
+        let s = &mut self.sides[side];
+        if s.branch != branch {
+            *s = Side { branch, picked: s.picked.take(), commits: Vec::new(), paging: Paging::More, error: None };
+        }
+    }
+}
+
+enum Msg {
+    Picked(Option<PathBuf>),
+    Page { side: usize, branch: String, skip: usize, page: git::Result<Vec<Commit>>, keep: bool },
+    Graph(git::Result<graph::Graph>),
+    Files { pair: (String, String), files: git::Result<Vec<git::Change>> },
+    View { key: ((String, String), String), view: git::Result<diffview::View> },
+}
+
+pub struct App {
+    /// None until a repository is open; the start screen shows meanwhile.
+    repo: Option<Repo>,
+    /// Why the last folder didn't open.
+    error: Option<String>,
+    picking: bool,
+    /// How the diff view lays out a diff, whichever file it shows.
+    mode: diff::Mode,
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
+}
+
+impl App {
+    /// Opens `dir` if given, else the folder picker: double-clicking the binary passes no arguments.
+    pub fn new(cc: &eframe::CreationContext, dir: Option<PathBuf>) -> Self {
+        let (tx, rx) = channel();
+        let mut app = Self { repo: None, error: None, picking: false, mode: diff::Mode::Full, tx, rx };
+        match dir {
+            Some(dir) => app.open(dir, &cc.egui_ctx),
+            None => app.pick(rfd::AsyncFileDialog::new().set_parent(cc), &cc.egui_ctx),
+        }
+        app
+    }
+
+    /// The dialog is created here on the main thread, as macOS requires, and awaited on a worker so the window keeps
+    /// responding; a blocked window gets greyed out as hung while the user browses.
+    fn pick(&mut self, dialog: rfd::AsyncFileDialog, ctx: &egui::Context) {
+        self.picking = true;
+        let dir = dialog.set_title("Open repository").pick_folder();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let dir = pollster::block_on(dir).map(|d| d.path().to_owned());
+            _ = tx.send(Msg::Picked(dir));
+            ctx.request_repaint();
+        });
+    }
+
+    fn open(&mut self, dir: PathBuf, ctx: &egui::Context) {
+        let path = match git::root(&dir) {
+            Ok(path) => path,
+            Err(e) => {
+                self.error = Some(format!("{}\n{}", dir.display(), e.lines().next().unwrap_or_default()));
+                return;
+            }
+        };
+        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — gitgoo")));
+        let head = git::head(&path);
+        let side = || Side { branch: head.clone(), commits: Vec::new(), paging: Paging::More, error: None, picked: None };
+        self.repo = Some(Repo {
+            sides: [side(), side()],
+            path,
+            pair: None,
+            files: Load::Waiting,
+            file: None,
+            shown: None,
+            view: Load::Waiting,
+            picker: None,
+        });
+        self.error = None;
+    }
+
+    fn receive(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                Msg::Picked(dir) => {
+                    self.picking = false;
+                    if let Some(dir) = dir {
+                        self.open(dir, ctx);
+                    }
+                }
+                Msg::Page { side, branch, skip, page, keep } => {
+                    let Some(repo) = &mut self.repo else { continue };
+                    let s = &mut repo.sides[side];
+                    // The column has since switched branch, or this page already arrived.
+                    if s.branch != branch || s.commits.len() != skip {
+                        continue;
+                    }
+                    if !keep {
+                        s.picked = None;
+                    }
+                    match page {
+                        Ok(page) => {
+                            s.paging = if page.len() < PAGE { Paging::Done } else { Paging::More };
+                            s.commits.extend(page);
+                        }
+                        Err(e) => {
+                            s.error = Some(e);
+                            s.paging = Paging::Done;
+                        }
+                    }
+                }
+                Msg::Files { pair, files } => {
+                    let Some(repo) = &mut self.repo else { continue };
+                    // A later pick superseded this comparison.
+                    if repo.pair.as_ref() != Some(&pair) {
+                        continue;
+                    }
+                    repo.files = match files {
+                        Ok(list) => {
+                            // Keep the picked file only if it still differs.
+                            if !list.iter().any(|c| repo.file.as_ref() == Some(&c.path)) {
+                                repo.file = None;
+                            }
+                            Load::Ready(list)
+                        }
+                        Err(e) => Load::Failed(e),
+                    };
+                }
+                Msg::Graph(graph) => {
+                    if let Some(p) = self.repo.as_mut().and_then(|r| r.picker.as_mut()) {
+                        p.graph = Some(graph);
+                    }
+                }
+                Msg::View { key, view } => {
+                    let Some(repo) = &mut self.repo else { continue };
+                    if repo.shown.as_ref() == Some(&key) {
+                        repo.view = view.map_or_else(Load::Failed, Load::Ready);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.receive(ui.ctx());
+        let Some(repo) = &mut self.repo else {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() / 3.0);
+                    ui.heading("gitgoo");
+                    ui.add_space(8.0);
+                    if ui.add_enabled(!self.picking, egui::Button::new("Open repository…")).clicked() {
+                        self.pick(rfd::AsyncFileDialog::new().set_parent(frame), ui.ctx());
+                    }
+                    if let Some(e) = &self.error {
+                        ui.add_space(8.0);
+                        ui.colored_label(ui.visuals().error_fg_color, e);
+                    }
+                });
+            });
+            return;
+        };
+        // First, so it spans the window above every column.
+        egui::Panel::top("toolbar").show(ui, |ui| ui.horizontal(|ui| diffview::mode_buttons(ui, &mut self.mode)));
+        let mut ask = None;
+        for (i, id) in ["a", "b"].into_iter().enumerate() {
+            let more = egui::Panel::left(id).resizable(true).default_size(300.0).min_size(120.0).show(ui, |ui| {
+                let s = &mut repo.sides[i];
+                if header(ui, &s.branch).on_hover_text("Pick a branch").clicked() {
+                    ask = Some(i);
+                }
+                ui.separator();
+                history(ui, s)
+            });
+            if more.inner {
+                repo.load(i, &self.tx, ui.ctx());
+            }
+        }
+        if let Some(i) = ask {
+            repo.pick_branch(i, &self.tx, ui.ctx());
+        }
+        repo.compare(&self.tx, ui.ctx());
+        egui::Panel::left("c").resizable(true).default_size(300.0).min_size(120.0).show(ui, |ui| files(ui, repo));
+        repo.show_file(&self.tx, ui.ctx());
+        egui::CentralPanel::default().show(ui, |ui| match &mut repo.view {
+            Load::Ready(view) => view.show(ui, self.mode),
+            Load::Waiting => drop(ui.weak("Pick a file in C.")),
+            Load::Loading => drop(ui.spinner()),
+            Load::Failed(e) => drop(ui.colored_label(ui.visuals().error_fg_color, e.as_str())),
+        });
+        match repo.picker.as_mut().map(|p| (p.side, p.show(ui.ctx(), &repo.sides[p.side].branch))) {
+            Some((side, picker::Outcome::Picked(branch))) => {
+                repo.picker = None;
+                repo.switch(side, branch);
+            }
+            Some((_, picker::Outcome::Closed)) => repo.picker = None,
+            _ => {}
+        }
+    }
+}
+
+/// The branch name heading a history column, with a triangle saying it opens something. Painted, as egui's fonts
+/// have no triangle glyph.
+fn header(ui: &mut egui::Ui, branch: &str) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(branch.to_owned(), TextStyle::Heading.resolve(ui.style()), ui.visuals().strong_text_color());
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + vec2(28.0, 6.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, branch));
+    let v = ui.style().interact(&resp);
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 3.0, v.weak_bg_fill);
+    }
+    let c = rect.right_center() - vec2(12.0, 0.0);
+    let triangle = vec![c + vec2(-5.0, -2.5), c + vec2(5.0, -2.5), c + vec2(0.0, 3.5)];
+    ui.painter().add(egui::Shape::convex_polygon(triangle, v.fg_stroke.color, egui::Stroke::NONE));
+    ui.painter().galley(rect.min + vec2(4.0, 3.0), galley, v.text_color());
+    resp
+}
+
+/// Draws one history column. True when it has scrolled near the end of what's loaded and more exists.
+fn history(ui: &mut egui::Ui, side: &mut Side) -> bool {
+    if let Some(e) = &side.error {
+        ui.colored_label(ui.visuals().error_fg_color, e);
+        return false;
+    }
+    let body = TextStyle::Body.resolve(ui.style());
+    let mono = TextStyle::Monospace.resolve(ui.style());
+    let line_h = ui.text_style_height(&TextStyle::Body);
+    let row_h = 2.0 * line_h + 8.0;
+    // Keyed by branch, so a switched column starts at the top.
+    let area = egui::ScrollArea::vertical().id_salt(&side.branch).auto_shrink(false);
+    let out = area.show_rows(ui, row_h, side.commits.len(), |ui, rows| {
+        for c in &side.commits[rows.clone()] {
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+            if resp.clicked() {
+                side.picked = Some(c.id.clone());
+            }
+            let picked = side.picked.as_deref() == Some(c.id.as_str());
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::ListItem, true, picked, &c.subject));
+            let v = ui.style().interact_selectable(&resp, picked);
+            let painter = ui.painter_at(rect);
+            if picked || resp.hovered() {
+                painter.rect_filled(rect, 2.0, v.weak_bg_fill);
+            }
+            let weak = if picked { v.text_color() } else { ui.visuals().weak_text_color() };
+            let wrap = TextWrapping::truncate_at_width(rect.width() - 12.0);
+            let mut top = LayoutJob::simple_singleline(c.subject.clone(), body.clone(), v.text_color());
+            top.wrap = wrap.clone();
+            let mut bottom = LayoutJob::default();
+            bottom.append(&c.id[..8], 0.0, TextFormat::simple(mono.clone(), weak));
+            bottom.append(&format!("  {} · {}", c.author, c.when), 0.0, TextFormat::simple(body.clone(), weak));
+            bottom.wrap = wrap;
+            painter.galley(rect.min + vec2(6.0, 4.0), painter.layout_job(top), Color32::PLACEHOLDER);
+            painter.galley(rect.min + vec2(6.0, 4.0 + line_h), painter.layout_job(bottom), Color32::PLACEHOLDER);
+        }
+        rows.end
+    });
+    side.paging == Paging::More && out.inner + PAGE / 5 >= side.commits.len()
+}
+
+fn green(v: &egui::Visuals) -> Color32 {
+    if v.dark_mode { Color32::from_rgb(0x6a, 0xc4, 0x6a) } else { Color32::from_rgb(0x2e, 0x7d, 0x32) }
+}
+
+/// Lighter than egui's error red, which drowns on the selection highlight.
+fn red(v: &egui::Visuals) -> Color32 {
+    if v.dark_mode { Color32::from_rgb(0xff, 0x8a, 0x80) } else { Color32::from_rgb(0xc6, 0x28, 0x28) }
+}
+
+/// Draws column C: the files that differ between A's and B's picks.
+fn files(ui: &mut egui::Ui, repo: &mut Repo) {
+    ui.heading("Files");
+    ui.separator();
+    let list = match &repo.files {
+        Load::Ready(list) if !list.is_empty() => list,
+        Load::Ready(_) => return drop(ui.weak("No differences.")),
+        Load::Waiting => return drop(ui.weak("Pick a commit in A and B.")),
+        Load::Loading => return drop(ui.spinner()),
+        Load::Failed(e) => return drop(ui.colored_label(ui.visuals().error_fg_color, e)),
+    };
+    let v = ui.visuals().clone();
+    let (added, removed) = list.iter().filter_map(|c| c.lines).fold((0, 0), |(a, r), (x, y)| (a + x, r + y));
+    let plural = if list.len() == 1 { "" } else { "s" };
+    ui.weak(format!("{} file{plural}, +{added} -{removed}", list.len()));
+    let body = TextStyle::Body.resolve(ui.style());
+    let mono = TextStyle::Monospace.resolve(ui.style());
+    let row_h = ui.text_style_height(&TextStyle::Body) + 6.0;
+    egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, row_h, list.len(), |ui, rows| {
+        for c in &list[rows] {
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+            if resp.clicked() {
+                repo.file = Some(c.path.clone());
+            }
+            let picked = repo.file.as_ref() == Some(&c.path);
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::ListItem, true, picked, &c.path));
+            let w = ui.style().interact_selectable(&resp, picked);
+            let painter = ui.painter_at(rect);
+            if picked || resp.hovered() {
+                painter.rect_filled(rect, 2.0, w.weak_bg_fill);
+            }
+            let weak = if picked { w.text_color() } else { v.weak_text_color() };
+            let mut counts = LayoutJob::default();
+            match c.lines {
+                Some((a, r)) => {
+                    counts.append(&format!("+{a}"), 0.0, TextFormat::simple(mono.clone(), green(&v)));
+                    counts.append(&format!("-{r}"), 6.0, TextFormat::simple(mono.clone(), red(&v)));
+                }
+                None => counts.append("bin", 0.0, TextFormat::simple(mono.clone(), weak)),
+            }
+            let counts = painter.layout_job(counts);
+            let status = match c.status {
+                'A' => green(&v),
+                'D' => red(&v),
+                'M' => v.warn_fg_color,
+                'R' | 'C' => v.hyperlink_color,
+                _ => weak,
+            };
+            let (dir, name) = c.path.rsplit_once('/').unwrap_or(("", &c.path));
+            let mut path = LayoutJob::default();
+            path.append(&c.status.to_string(), 0.0, TextFormat::simple(mono.clone(), status));
+            path.append(name, 8.0, TextFormat::simple(body.clone(), w.text_color()));
+            path.append(dir, 8.0, TextFormat::simple(body.clone(), weak));
+            path.wrap = TextWrapping::truncate_at_width(rect.width() - counts.size().x - 20.0);
+            painter.galley(rect.min + vec2(6.0, 3.0), painter.layout_job(path), Color32::PLACEHOLDER);
+            painter.galley(rect.right_top() + vec2(-6.0 - counts.size().x, 3.0), counts, Color32::PLACEHOLDER);
+            if let Some(old) = &c.old {
+                resp.on_hover_text(format!("from {old}"));
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    /// Steps the UI until `done` holds; background git calls land between frames.
+    fn wait(h: &mut Harness<App>, done: impl Fn(&Harness<App>) -> bool) {
+        for _ in 0..500 {
+            h.step();
+            if done(h) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("UI never settled");
+    }
+
+    #[test]
+    fn picking_commits_and_a_file_shows_the_diff() {
+        let dir = git::tests::repo("ui", &[]);
+        let commit = |text: &str, subject: &str| {
+            std::fs::write(dir.join("code.rs"), text).unwrap();
+            git::tests::run(&dir, &["add", "code.rs"]);
+            git::tests::run(&dir, &["commit", "-q", "-m", subject]);
+        };
+        // Twenty unchanged lines between the changes, for the changes-only mode to fold away.
+        let notes: String = (1..=20).map(|i| format!("// note {i}\n")).collect();
+        let main = "fn main() {\n    let name = \"world\";\n    println!(\"Hello, {name}!\");\n    let unused = 1;\n}\n\n";
+        commit(&format!("{main}{notes}\nfn helper(x: i32) -> i32 {{\n\tx + 1\n}}\n"), "one");
+        let main = "fn main() {\n    let name = \"gitgoo\";\n    println!(\"Hello, {name}!\");\n    greet(name);\n}\n\n";
+        let greet = "fn greet(who: &str) {\n    println!(\"hi {who}\");\n}\n\n";
+        commit(&format!("{main}{greet}{notes}\nfn helper(x: i32) -> i32 {{\n\tx + 2\n}}\n"), "two");
+        let mut h = Harness::builder().with_size([1600.0, 500.0]).build_eframe(|cc| App::new(cc, Some(dir.clone())));
+        wait(&mut h, |h| h.query_all_by_label("two").count() == 2);
+        h.get_all_by_label("one").next().unwrap().click();
+        h.get_all_by_label("two").nth(1).unwrap().click();
+        wait(&mut h, |h| h.query_by_label("code.rs").is_some());
+        h.get_by_label("code.rs").click();
+        wait(&mut h, |h| matches!(h.state().repo.as_ref().unwrap().view, Load::Ready(_)));
+        h.step();
+        shot(&mut h, "diff");
+        for (button, name, mode) in [("Changes only", "chunks", diff::Mode::Chunks), ("Inline", "inline", diff::Mode::Inline)] {
+            h.get_by_label(button).click();
+            h.run_steps(2);
+            shot(&mut h, name);
+            assert_eq!(h.state().mode, mode);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn picking_a_branch_switches_the_column_and_keeps_a_commit_it_contains() {
+        let dir = crate::graph::tests::branchy("ui-picker");
+        let mut h = Harness::builder().with_size([1600.0, 700.0]).build_eframe(|cc| App::new(cc, Some(dir.clone())));
+        let a = |h: &Harness<App>| h.state().repo.as_ref().unwrap().sides[0].picked.clone();
+        let loaded = |subject: &'static str| {
+            move |h: &Harness<App>| h.state().repo.as_ref().unwrap().sides[0].commits.iter().any(|c| c.subject == subject)
+        };
+        wait(&mut h, |h| h.query_all_by_label("c3").count() == 2);
+        h.get_all_by_label("c3").next().unwrap().click();
+        h.step();
+        let c3 = a(&h).unwrap();
+        // Opens column A's picker through its header.
+        let open_picker = |h: &mut Harness<App>, header: &str| {
+            h.get_all_by_label(header).next().unwrap().click();
+            wait(h, |h| h.state().repo.as_ref().unwrap().picker.as_ref().is_some_and(|p| p.graph.is_some()));
+            h.step();
+        };
+        open_picker(&mut h, "main");
+        shot(&mut h, "picker");
+        h.get_by_label("open").click();
+        wait(&mut h, loaded("o2"));
+        assert_eq!(a(&h).as_deref(), Some(c3.as_str()), "open forked after c3, so it contains it");
+        open_picker(&mut h, "open");
+        h.get_by_label("a").click();
+        wait(&mut h, loaded("a1"));
+        h.step();
+        assert_eq!(a(&h), None, "a forked before c3");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Not a check: renders a real repo's branch picker, and times the graph, for a person to look at.
+    /// `GITGOO_REPO=path GITGOO_SHOTS=folder cargo test real_repo -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_repo() {
+        let dir = PathBuf::from(std::env::var("GITGOO_REPO").expect("GITGOO_REPO"));
+        let start = std::time::Instant::now();
+        let g = graph::load(&dir).unwrap();
+        eprintln!("{} lanes besides {} in {:?}", g.lanes.len(), g.trunk.name, start.elapsed());
+        let mut h = Harness::builder().with_size([1600.0, 900.0]).build_eframe(|cc| App::new(cc, Some(dir.clone())));
+        wait(&mut h, |h| !h.state().repo.as_ref().unwrap().sides[0].commits.is_empty());
+        let branch = h.state().repo.as_ref().unwrap().sides[0].branch.clone();
+        h.get_all_by_label(&branch).next().unwrap().click();
+        wait(&mut h, |h| h.state().repo.as_ref().unwrap().picker.as_ref().is_some_and(|p| p.graph.is_some()));
+        h.step();
+        shot(&mut h, "real-picker");
+    }
+
+    /// With GITGOO_SHOTS set to a folder, saves what the UI shows there, for a person to look at.
+    fn shot(h: &mut Harness<App>, name: &str) {
+        if let Ok(dir) = std::env::var("GITGOO_SHOTS") {
+            h.render().unwrap().save(std::path::Path::new(&dir).join(format!("{name}.png"))).unwrap();
+        }
+    }
+}

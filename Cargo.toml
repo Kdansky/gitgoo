@@ -1,0 +1,13 @@
+[package]
+name = "gitgoo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.37.0"
+pollster = "1.0.1"
+rfd = "0.18.0"
+similar = "3.2.1"
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["eframe", "wgpu", "snapshot"] }
