@@ -106,3 +106,5 @@ Later: uncommitted and staged changes as entries atop each list; marking files r
 
 - Windows: git is spawned with `CREATE_NO_WINDOW`, or each call flashes a console. The binary sets `windows_subsystem = "windows"`.
 - Builds: Linux here, macOS on the Mac. No CI.
+- Linux releases: `packaging/linux/release.sh` builds in a Debian bookworm container and packs a tarball with an `install.sh`. A binary needs the glibc it was built against; bookworm's makes it run on distributions since 2022, where a rolling distro's wouldn't.
+- Icon: `assets/gitgoo.svg`, rendered to the PNG the binary embeds as its window icon. Wayland ignores window icons: the desktop finds the icon through the launcher whose `StartupWMClass` matches the app id, `gitgoo`, so `install.sh` installs that launcher.

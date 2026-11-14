@@ -16,3 +16,6 @@ similar = "3.2.1"
 
 [dev-dependencies]
 egui_kittest = { version = "0.37.0", features = ["eframe", "wgpu", "snapshot"] }
+
+[profile.release]
+strip = true

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=gitgoo
+GenericName=Git review tool
+Comment=Compare any two commits on any two branches
+Exec=gitgoo %f
+Icon=gitgoo
+Terminal=false
+Categories=Development;RevisionControl;
+Keywords=git;diff;review;compare;
+StartupWMClass=gitgoo

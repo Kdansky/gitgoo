@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2e3647"/>
+      <stop offset="1" stop-color="#171b23"/>
+    </linearGradient>
+    <linearGradient id="link" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#e5534b" stop-opacity="0.7"/>
+      <stop offset="1" stop-color="#46c35a" stop-opacity="0.7"/>
+    </linearGradient>
+    <clipPath id="left"><rect x="30" y="50" width="86" height="156" rx="12"/></clipPath>
+    <clipPath id="right"><rect x="140" y="50" width="86" height="156" rx="12"/></clipPath>
+  </defs>
+  <rect x="10" y="10" width="236" height="236" rx="54" fill="url(#bg)"/>
+  <rect x="11" y="11" width="234" height="234" rx="53" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="2"/>
+  <g clip-path="url(#left)">
+    <rect x="30" y="50" width="86" height="156" fill="#353e50"/>
+    <rect x="30" y="98" width="86" height="32" fill="#e5534b"/>
+    <g fill="#8f9ab0">
+      <rect x="42" y="64" width="54" height="9" rx="4.5"/>
+      <rect x="42" y="81" width="38" height="9" rx="4.5"/>
+      <rect x="42" y="140" width="60" height="9" rx="4.5"/>
+      <rect x="42" y="157" width="44" height="9" rx="4.5"/>
+      <rect x="42" y="174" width="30" height="9" rx="4.5"/>
+    </g>
+    <g fill="#ffffff" fill-opacity="0.85">
+      <rect x="42" y="103" width="50" height="8" rx="4"/>
+      <rect x="42" y="117" width="34" height="8" rx="4"/>
+    </g>
+  </g>
+  <path d="M116,98 C128,98 128,98 140,98 L140,148 C128,148 128,130 116,130 Z" fill="url(#link)"/>
+  <g clip-path="url(#right)">
+    <rect x="140" y="50" width="86" height="156" fill="#353e50"/>
+    <rect x="140" y="98" width="86" height="50" fill="#46c35a"/>
+    <g fill="#8f9ab0">
+      <rect x="152" y="64" width="54" height="9" rx="4.5"/>
+      <rect x="152" y="81" width="38" height="9" rx="4.5"/>
+      <rect x="152" y="158" width="60" height="9" rx="4.5"/>
+      <rect x="152" y="175" width="44" height="9" rx="4.5"/>
+    </g>
+    <g fill="#ffffff" fill-opacity="0.85">
+      <rect x="152" y="103" width="50" height="8" rx="4"/>
+      <rect x="152" y="117" width="62" height="8" rx="4"/>
+      <rect x="152" y="131" width="40" height="8" rx="4"/>
+    </g>
+  </g>
+</svg>

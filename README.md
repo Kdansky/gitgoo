@@ -6,6 +6,12 @@ Most tools show one commit's changes. gitgoo compares two arbitrary points: skip
 
 ![gitgoo reviewing its own repo: two commit histories, the files between the picked commits, and Cargo.toml side by side](docs/screenshot.png)
 
+## Installing
+
+Linux, x86_64: download `gitgoo-<version>-linux-x86_64.tar.gz` from [Releases](https://github.com/Kdansky/gitgoo/releases), unpack it and run `./install.sh`. That puts `gitgoo` in `~/.local/bin` and adds it to the application menu. Needs glibc 2.35 or later (Ubuntu 22.04, Debian 12, Fedora 36 and newer) and `git`.
+
+To remove it: `rm ~/.local/bin/gitgoo ~/.local/share/applications/gitgoo.desktop ~/.local/share/icons/hicolor/*/apps/gitgoo.*`
+
 ## Using it
 
 Start the application and pick a repository folder, or run `gitgoo path/to/repo`. Repositories opened before are listed on the start screen and behind the toolbar's "Open recent".
