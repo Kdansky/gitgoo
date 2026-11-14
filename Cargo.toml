@@ -2,6 +2,10 @@
 name = "gitgoo"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
+description = "A git review tool: pick any two commits on any two branches and see everything that differs between them"
+license = "MIT"
+repository = "https://github.com/Kdansky/gitgoo"
 
 [dependencies]
 eframe = "0.37.0"
