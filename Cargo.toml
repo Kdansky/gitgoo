@@ -1,6 +1,6 @@
 [package]
 name = "gitgoo"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A git review tool: pick any two commits on any two branches and see everything that differs between them"
