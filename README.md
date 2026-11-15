@@ -17,10 +17,10 @@ To remove it: `rm ~/.local/bin/gitgoo ~/.local/share/applications/gitgoo.desktop
 Start the application and pick a repository folder, or run `gitgoo path/to/repo`. Repositories opened before are listed on the start screen and behind the toolbar's "Open recent".
 
 - **First and second column**: two commit histories. The branch name above each opens a map of the branches, drawn leaving and rejoining main; click one to switch.
-- **List of files**: the files that differ between the commits picked in A and B, with line counts.
-- **Two columns of text**: the picked file, old (A) on the left and new (B) on the right, with changed words marked.
+- **List of files**: the files that differ between the commits picked in A and B, with line counts. Clicking one jumps to it.
+- **Two columns of text**: every file that differs, one after another, old (A) on the left and new (B) on the right, with changed words marked.
 
-The toolbar switches the diff between the whole file side by side, only the changes, and inline.
+The toolbar switches between all files and one at a time, for very large diffs, and the diff between the whole file side by side, only the changes, and inline.
 
 Shows UTF-8 files, no binaries or other formats.
 

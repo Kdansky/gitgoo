@@ -4,9 +4,10 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use eframe::egui::{self, Color32, Sense, TextFormat, TextStyle, vec2};
 use egui::text::{LayoutJob, TextWrapping};
 
+use crate::diffview::{self, Layout};
 use crate::git::{self, Commit};
 use crate::recent::{self, Ask, Recents};
-use crate::{diff, diffview, graph, picker};
+use crate::{diff, graph, picker};
 
 const PAGE: usize = 500;
 
@@ -43,10 +44,12 @@ struct Repo {
     /// The commits `files` compares: A's pick, B's pick.
     pair: Option<(String, String)>,
     files: Load<Vec<git::Change>>,
+    /// The file picked in C. Showing all files, the one at the top of the view.
     file: Option<String>,
-    /// The commits and path `view` shows.
-    shown: Option<((String, String), String)>,
-    view: Load<diffview::View>,
+    layout: Layout,
+    /// The commits `view` compares, and the one file it shows, or None for all of them.
+    shown: Option<((String, String), Option<String>)>,
+    view: Option<diffview::View>,
     picker: Option<picker::Picker>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
@@ -57,7 +60,6 @@ enum Msg {
     Page { side: usize, branch: String, skip: usize, page: git::Result<Vec<Commit>>, keep: bool },
     Graph(git::Result<graph::Graph>),
     Files { pair: (String, String), files: git::Result<Vec<git::Change>> },
-    View { key: ((String, String), String), view: git::Result<diffview::View> },
 }
 
 impl Repo {
@@ -71,8 +73,9 @@ impl Repo {
             pair: None,
             files: Load::Waiting,
             file: None,
+            layout: Layout::All,
             shown: None,
-            view: Load::Waiting,
+            view: None,
             picker: None,
             tx,
             rx,
@@ -99,42 +102,53 @@ impl Repo {
         });
     }
 
-    /// Reloads columns D and E when the picked file, or the commits it's compared across, changed.
-    fn show_file(&mut self, ctx: &egui::Context) {
+    /// Rebuilds columns D and E when the picked commits or the layout changed, or, showing one file, the picked file.
+    fn show_files(&mut self, ctx: &egui::Context) {
         // Until the new list arrives it's unknown whether the picked file still differs.
         let Load::Ready(list) = &self.files else { return };
-        let change = self.file.as_ref().and_then(|f| list.iter().find(|c| &c.path == f));
-        let key = self.pair.clone().zip(change.map(|c| c.path.clone()));
+        let key = match self.layout {
+            Layout::All => self.pair.clone().map(|p| (p, None)),
+            Layout::One => self.pair.clone().zip(self.file.clone()).map(|(p, f)| (p, Some(f))),
+        };
         if key == self.shown {
             return;
         }
         self.shown = key.clone();
-        let (Some(key), Some(c)) = (key, change) else {
-            self.view = Load::Waiting;
+        let Some((pair, one)) = key else {
+            self.view = None;
             return;
         };
-        let old = (c.status != 'A').then(|| c.old.clone().unwrap_or_else(|| c.path.clone()));
-        let new = (c.status != 'D').then(|| c.path.clone());
-        self.view = Load::Loading;
-        let (tx, ctx, repo) = (self.tx.clone(), ctx.clone(), self.path.clone());
+        let files: Vec<git::Change> = list.iter().filter(|c| one.as_ref().is_none_or(|f| f == &c.path)).cloned().collect();
+        let blobs: Vec<_> = files.iter().map(|c| c.blobs.clone()).collect();
+        // The view shows each file as it arrives, top first. The channel goes with the view, so the worker for a replaced
+        // one stops at its next file.
+        let (tx, rx) = channel();
+        let (ctx, repo) = (ctx.clone(), self.path.clone());
         std::thread::spawn(move || {
-            let ((a, b), _) = &key;
-            let text = |rev: &str, path: &Option<String>| match path {
-                Some(p) => git::blob(&repo, rev, p).map(diff::text),
-                None => Ok(Some(String::new())),
-            };
-            let title = |rev: &str, path: &Option<String>| match path {
-                Some(p) => format!("{p} @ {}", &rev[..8]),
-                None => format!("(not in {})", &rev[..8]),
-            };
-            let view = match (text(a, &old), text(b, &new)) {
-                (Err(e), _) | (_, Err(e)) => Err(e),
-                (Ok(Some(o)), Ok(Some(n))) => Ok(diffview::View::new(diff::diff(&o, &n), [title(a, &old), title(b, &new)])),
-                _ => Err("binary file not supported".to_owned()),
-            };
-            _ = tx.send(Msg::View { key, view });
-            ctx.request_repaint();
+            let mut cat = git::Cat::new(&repo);
+            for (i, ids) in blobs.iter().enumerate() {
+                let mut text = |id: &Option<String>| match (&mut cat, id) {
+                    (Err(e), _) => Err(e.clone()),
+                    (Ok(_), None) => Ok(Some(String::new())),
+                    (Ok(cat), Some(id)) => cat.blob(id).map(diff::text),
+                };
+                let body = match (text(&ids[0]), text(&ids[1])) {
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                    (Ok(Some(o)), Ok(Some(n))) => Ok(diff::diff(&o, &n)),
+                    _ => Err("binary file not supported".to_owned()),
+                };
+                if tx.send((i, body)).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            }
         });
+        let mut view = diffview::View::new(pair, files, rx);
+        // Showing all files, a new comparison or a switch from one file opens at the file the reader was on.
+        if let Some(f) = self.file.as_ref().filter(|_| one.is_none()) {
+            view.jump(f);
+        }
+        self.view = Some(view);
     }
 
     fn load(&mut self, side: usize, ctx: &egui::Context) {
@@ -210,11 +224,6 @@ impl Repo {
                 Msg::Graph(graph) => {
                     if let Some(p) = &mut self.picker {
                         p.graph = Some(graph);
-                    }
-                }
-                Msg::View { key, view } => {
-                    if self.shown.as_ref() == Some(&key) {
-                        self.view = view.map_or_else(Load::Failed, Load::Ready);
                     }
                 }
             }
@@ -317,6 +326,8 @@ impl eframe::App for App {
                             ask = Some(Ask::Show);
                         }
                         ui.separator();
+                        diffview::layout_buttons(ui, &mut repo.layout);
+                        ui.separator();
                         diffview::mode_buttons(ui, &mut self.mode);
                     })
                 });
@@ -339,12 +350,17 @@ impl eframe::App for App {
                 }
                 repo.compare(ui.ctx());
                 egui::Panel::left("c").resizable(true).default_size(300.0).min_size(120.0).show(ui, |ui| files(ui, repo));
-                repo.show_file(ui.ctx());
+                repo.show_files(ui.ctx());
                 egui::CentralPanel::default().show(ui, |ui| match &mut repo.view {
-                    Load::Ready(view) => view.show(ui, self.mode),
-                    Load::Waiting => drop(ui.weak("Pick a file in C.")),
-                    Load::Loading => drop(ui.spinner()),
-                    Load::Failed(e) => drop(ui.colored_label(ui.visuals().error_fg_color, e.as_str())),
+                    Some(view) => {
+                        view.show(ui, self.mode);
+                        // C marks the file being read.
+                        if repo.file.as_deref() != view.file() {
+                            repo.file = view.file().map(str::to_owned);
+                        }
+                    }
+                    None if repo.layout == Layout::One => drop(ui.weak("Pick a file in C.")),
+                    None => drop(ui.weak("Pick a commit in A and B.")),
                 });
                 match repo.picker.as_mut().map(|p| (p.side, p.show(ui.ctx(), &repo.sides[p.side].branch))) {
                     Some((side, picker::Outcome::Picked(branch))) => {
@@ -499,6 +515,10 @@ fn files(ui: &mut egui::Ui, repo: &mut Repo) {
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
             if resp.clicked() {
                 repo.file = Some(c.path.clone());
+                // Showing all files, the view brings it to the top; showing one, it's replaced.
+                if let Some(view) = &mut repo.view {
+                    view.jump(&c.path);
+                }
             }
             let picked = repo.file.as_ref() == Some(&c.path);
             resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::ListItem, true, picked, &c.path));
@@ -557,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn picking_commits_and_a_file_shows_the_diff() {
+    fn picking_commits_shows_the_diff() {
         let dir = git::tests::repo("ui", &[]);
         let commit = |text: &str, subject: &str| {
             std::fs::write(dir.join("code.rs"), text).unwrap();
@@ -575,9 +595,7 @@ mod tests {
         wait(&mut h, |h| h.query_all_by_label("two").count() == 2);
         h.get_all_by_label("one").next().unwrap().click();
         h.get_all_by_label("two").nth(1).unwrap().click();
-        wait(&mut h, |h| h.query_by_label("code.rs").is_some());
-        h.get_by_label("code.rs").click();
-        wait(&mut h, |h| matches!(h.state().repo.as_ref().unwrap().view, Load::Ready(_)));
+        wait(&mut h, |h| loaded(h, 1));
         h.step();
         shot(&mut h, "diff");
         for (button, name, mode) in [("Changes only", "chunks", diff::Mode::Chunks), ("Inline", "inline", diff::Mode::Inline)] {
@@ -586,6 +604,60 @@ mod tests {
             shot(&mut h, name);
             assert_eq!(h.state().mode, mode);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Whether the view holds `n` files, all arrived.
+    fn loaded(h: &Harness<App>, n: usize) -> bool {
+        h.state().repo.as_ref().unwrap().view.as_ref().is_some_and(|v| v.loaded() == (n, n))
+    }
+
+    #[test]
+    fn every_file_shows_at_once_and_clicking_one_jumps_to_it() {
+        let dir = git::tests::repo("ui-all", &[]);
+        let names = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt"];
+        let commit = |changed: usize, subject: &str| {
+            for (i, name) in names.iter().enumerate() {
+                // The last file is short, so a jump to it needs room below.
+                let n = if i == names.len() - 1 { 3 } else { 40 };
+                let text: String =
+                    (0..n).map(|k| if k == changed % n { format!("{name} changed\n") } else { format!("{name} {k}\n") }).collect();
+                std::fs::write(dir.join(name), text).unwrap();
+            }
+            git::tests::run(&dir, &["add", "-A"]);
+            git::tests::run(&dir, &["commit", "-q", "-m", subject]);
+        };
+        commit(0, "one");
+        commit(20, "two");
+        let mut h = Harness::builder().with_size([1600.0, 500.0]).build_eframe(|cc| App::new(cc, Some(dir.clone())));
+        let top = |h: &Harness<App>| h.state().repo.as_ref().unwrap().view.as_ref().and_then(|v| v.file().map(str::to_owned));
+        wait(&mut h, |h| h.query_all_by_label("two").count() == 2);
+        h.get_all_by_label("one").next().unwrap().click();
+        h.get_all_by_label("two").nth(1).unwrap().click();
+        // No file picked, yet every file shows.
+        wait(&mut h, |h| loaded(h, names.len()));
+        h.get_by_label("Changes only").click();
+        h.run_steps(2);
+        shot(&mut h, "all");
+        h.get_by_label("Side by side").click();
+        h.run_steps(2);
+        assert_eq!(top(&h).as_deref(), Some("a.txt"));
+        assert_eq!(h.state().repo.as_ref().unwrap().file.as_deref(), Some("a.txt"), "C marks the file at the top");
+        h.get_by_label("f.txt").click();
+        h.run_steps(2);
+        shot(&mut h, "all-end");
+        assert_eq!(top(&h).as_deref(), Some("f.txt"));
+        h.get_by_label("One file").click();
+        wait(&mut h, |h| loaded(h, 1));
+        assert_eq!(top(&h).as_deref(), Some("f.txt"), "one file shows the file the reader was on");
+        h.get_by_label("c.txt").click();
+        wait(&mut h, |h| loaded(h, 1) && top(h).as_deref() == Some("c.txt"));
+        h.step();
+        shot(&mut h, "one");
+        h.get_by_label("All files").click();
+        wait(&mut h, |h| loaded(h, names.len()));
+        h.step();
+        assert_eq!(top(&h).as_deref(), Some("c.txt"), "all files opens at the file the reader was on");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

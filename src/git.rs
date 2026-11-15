@@ -1,7 +1,8 @@
 //! Runs the git binary and parses its output. Knows nothing of the UI.
 
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -18,7 +19,7 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&raw(dir, args)?).into_owned())
 }
 
-fn raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+fn command(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir).args(args);
     #[cfg(windows)]
@@ -27,7 +28,11 @@ fn raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
         // CREATE_NO_WINDOW: otherwise a GUI app flashes a console for every call.
         cmd.creation_flags(0x0800_0000);
     }
-    let out = cmd.output().map_err(|e| format!("can't run git: {e}"))?;
+    cmd
+}
+
+fn raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let out = command(dir, args).output().map_err(|e| format!("can't run git: {e}"))?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().trim_start_matches("fatal: ").to_owned());
     }
@@ -39,9 +44,47 @@ pub fn contains(repo: &Path, rev: &str, commit: &str) -> bool {
     raw(repo, &["merge-base", "--is-ancestor", commit, rev]).is_ok()
 }
 
-/// The file `path` as it is in `rev`, byte for byte.
-pub fn blob(repo: &Path, rev: &str, path: &str) -> Result<Vec<u8>> {
-    raw(repo, &["cat-file", "blob", &format!("{rev}:{path}")])
+/// One `git cat-file --batch`, reading files by blob id for as long as it's kept: a diff of many files costs one process,
+/// not two per file.
+pub struct Cat {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+}
+
+impl Cat {
+    pub fn new(repo: &Path) -> Result<Self> {
+        let child = command(repo, &["cat-file", "--batch"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
+        let mut child = child.map_err(|e| format!("can't run git: {e}"))?;
+        let (input, output) = (child.stdin.take().unwrap(), BufReader::new(child.stdout.take().unwrap()));
+        Ok(Self { child, input, output })
+    }
+
+    /// The blob `id`, byte for byte.
+    pub fn blob(&mut self, id: &str) -> Result<Vec<u8>> {
+        let io = |e: std::io::Error| format!("git cat-file: {e}");
+        // git flushes each answer before reading the next question, so asking one at a time can't deadlock.
+        writeln!(self.input, "{id}").map_err(io)?;
+        let mut head = String::new();
+        self.output.read_line(&mut head).map_err(io)?;
+        // "<id> blob <size>", or "<id> missing".
+        let f: Vec<&str> = head.split_whitespace().collect();
+        let [_, kind, size] = f[..] else { return Err(format!("no blob {id}")) };
+        let mut data = vec![0; size.parse::<usize>().map_err(|_| format!("git cat-file: {head}"))? + 1];
+        self.output.read_exact(&mut data).map_err(io)?;
+        data.pop();
+        if kind != "blob" {
+            return Err(format!("{id} is a {kind}, not a file"));
+        }
+        Ok(data)
+    }
+}
+
+impl Drop for Cat {
+    fn drop(&mut self) {
+        _ = self.child.kill();
+        _ = self.child.wait();
+    }
 }
 
 pub fn root(dir: &Path) -> Result<PathBuf> {
@@ -71,6 +114,7 @@ pub fn log(repo: &Path, rev: &str, skip: usize, n: usize) -> Result<Vec<Commit>>
 }
 
 /// One file that differs between two commits.
+#[derive(Clone)]
 pub struct Change {
     /// A, M, D, R, C or T, as git reports it.
     pub status: char,
@@ -79,24 +123,29 @@ pub struct Change {
     pub old: Option<String>,
     /// Lines added and removed; None for binary files.
     pub lines: Option<(usize, usize)>,
+    /// The blob ids at the older and newer commit; None where the file doesn't exist.
+    pub blobs: [Option<String>; 2],
 }
 
 /// Every file that differs between `a` and `b`, in git's path order.
 pub fn changes(repo: &Path, a: &str, b: &str) -> Result<Vec<Change>> {
-    let out = git(repo, &["diff", "--no-ext-diff", "--no-color", "--raw", "--numstat", "-z", "-M", a, b, "--"])?;
+    let out = git(repo, &["diff", "--no-ext-diff", "--no-color", "--raw", "--no-abbrev", "--numstat", "-z", "-M", a, b, "--"])?;
     // Raw records come first, then numstat records for the same files in the same order.
     let (mut list, mut counts) = (Vec::new(), Vec::new());
     let mut t = out.split('\0');
     while let Some(rec) = t.next() {
         if let Some(raw) = rec.strip_prefix(':') {
-            // ":100644 100644 de98044 a7bc997 R086", then one path, or two for a rename or copy.
-            let status = raw.rsplit(' ').next().and_then(|s| s.chars().next()).unwrap_or('M');
+            // ":100644 100644 de98044… a7bc997… R086", then one path, or two for a rename or copy. A side without the file
+            // has an id of zeros.
+            let f: Vec<&str> = raw.split(' ').collect();
+            let status = f.last().and_then(|s| s.chars().next()).unwrap_or('M');
+            let id = |i: usize| f.get(i).filter(|s| !s.bytes().all(|b| b == b'0')).map(|s| s.to_string());
             let first = t.next().unwrap_or_default().to_owned();
             let (path, old) = match status {
                 'R' | 'C' => (t.next().unwrap_or_default().to_owned(), Some(first)),
                 _ => (first, None),
             };
-            list.push(Change { status, path, old, lines: None });
+            list.push(Change { status, path, old, lines: None, blobs: [id(2), id(3)] });
         } else if !rec.is_empty() {
             // "2\t1\tpath"; binary files count "-\t-"; a rename has an empty path, then old and new as their own records.
             let mut f = rec.splitn(3, '\t');
@@ -173,6 +222,14 @@ pub(crate) mod tests {
                 ('R', "sub/new.txt", Some("old.txt"), Some((0, 0))),
             ]
         );
+        let sides: Vec<_> = list.iter().map(|c| c.blobs.clone().map(|id| id.is_some())).collect();
+        assert_eq!(sides, [[true, true], [true, true], [false, true], [true, false], [true, true]]);
+        let mut cat = Cat::new(&dir).unwrap();
+        let [old, new] = list[0].blobs.clone().map(Option::unwrap);
+        assert_eq!(cat.blob(&old).unwrap(), b"a\nb\nc\n");
+        assert_eq!(cat.blob(&new).unwrap(), b"a\nB\nc\nd\n");
+        assert!(cat.blob(&"0".repeat(40)).is_err());
+        assert_eq!(cat.blob(&list[1].blobs[1].clone().unwrap()).unwrap(), b"x\0z", "answers go on after a failed question");
         assert!(changes(&dir, "HEAD", "HEAD").unwrap().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }

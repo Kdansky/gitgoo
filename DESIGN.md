@@ -10,19 +10,21 @@ Five columns:
 
 | A | B | C | D | E |
 |---|---|---|---|---|
-| history, left | history, right | changed files | file at A | file at B |
+| history, left | history, right | changed files | files at A | files at B |
 
 - **A, B**: a branch's commits, newest first. The branch name heads the column; clicking it opens the branch picker.
-- **C**: files that differ between the commits picked in A and B, with status and +/− line counts. Clickable.
-- **D, E**: the picked file side by side, aligned, scrolling together. The old file is always A's commit, on the left; the new one B's.
+- **C**: files that differ between the commits picked in A and B, with status and +/− line counts. Clicking one brings it to the top of D and E. The file at the top is the one marked, so the mark follows the reader.
+- **D, E**: every file that differs, one after another, as in GitLab's compare view: side by side, aligned, scrolling together. Each file starts with a header row naming it, with its line counts. The old file is always A's commit, on the left; the new one B's. Above the columns, each side names the file at the top and its commit.
 
-A toolbar spans the window above the columns: "Open recent" leftmost, then a group switching the diff view between three modes:
+A toolbar spans the window above the columns: "Open recent" leftmost, then a pair switching between all files and one, then a group switching the diff view between three modes:
 
 1. Side by side, the whole file.
 2. Side by side, only the changes and 4 lines around each; the stretches left out show as one "n unchanged lines" row.
 3. Inline: D and E become one column with both line numbers, each run of changes showing everything it removed, then everything it added.
 
 The mode holds across files. Switching keeps the reader's place.
+
+All files reads and diffs every file that differs; for a diff too large for that, "One file" shows only the file picked in C, and clicking another file replaces it. Switching between the two keeps the file the reader was on. Each repository opens showing all files, whatever was picked last.
 
 The branch picker is a modal map. The trunk (whatever origin's HEAD names, else main or master) runs along the top; every other branch gets a row below, most recently changed first. Time runs left to right, events spaced evenly rather than by date. A branch's line drops from where it left the trunk and runs to its tip; a merged one, dimmed, curves back up where it was merged, even if it got there inside another branch. A branch that only points at a trunk commit is a dashed drop. No commit dots: only names, and hovering one shows its last commit's date, its commit count, and when it left and rejoined the trunk. Typing filters; Enter picks the top match. Remote branches show unless a local branch has the name; several remotes carrying one branch at one commit show once, origin preferred.
 
@@ -58,8 +60,8 @@ Git is the `git` binary, not git2 or gitoxide: it honours the user's config and 
 |---|---|
 | branch picker | `git for-each-ref --sort=-committerdate`; `git name-rev` finds the trunk commit that merged each merged branch, whatever route it took; `git merge-base` where each left |
 | A, B | `git log`, paged as the list scrolls |
-| C | `git diff --raw --numstat -z -M X Y` |
-| D, E | one long-lived `git cat-file --batch`, fed `rev:path` |
+| C | `git diff --raw --no-abbrev --numstat -z -M X Y` |
+| D, E | one `git cat-file --batch` per view, fed the blob ids C's raw diff names |
 
 `-z` everywhere, so git never quotes unusual paths.
 
@@ -80,7 +82,7 @@ src/
 
 `git.rs` and `diff.rs` know nothing of the UI and are tested against throwaway repos. UI tests drive the whole app offscreen with `egui_kittest`, finding rows by their accessibility labels; `GITGOO_SHOTS=folder cargo test` saves what the UI tests see; `GITGOO_REPO=path GITGOO_SHOTS=folder cargo test real_repo -- --ignored` renders a real repo's picker.
 
-Nothing blocks a frame. Git calls and highlighting run on worker threads and send results back; a result tagged with a request the UI has since moved past is dropped. Each open repository has its own channel, so work for one since replaced lands nowhere.
+Nothing blocks a frame. Git calls and highlighting run on worker threads and send results back; a result tagged with a request the UI has since moved past is dropped. Each open repository has its own channel, so work for one since replaced lands nowhere. So does each diff view: its worker diffs the files top first and sends each when done, so the first show while the rest load. A replaced view drops its channel, and its worker stops at the next file.
 
 ## Diff view
 
@@ -90,6 +92,8 @@ Nothing blocks a frame. Git calls and highlighting run on worker threads and sen
 - Highlight each full file, not the diff: a line inside a multi-line comment is a comment only because of the lines above it.
 - Bundled monospace font, line numbers per side, dimmed filler rows, word-level colour, an overview strip of all changes (click to jump), next/previous change keys, whitespace toggle, light/dark from the OS.
 - What each mode draws is a list of items picked from the rows (`diff::items`): a row, one side of a row, or a gap. The view paints whichever list it's given.
+- Several files make one list: per file a blank row, a header row, then its items, all one height, so one `show_rows` covers them. A file still loading, binary or empty is one note row. A lone file gets no header.
+- A file arriving above the reader, or a mode change, keeps the line at the top where it is. A short last file gets blank room below it, so a jump can still bring it to the top.
 
 ## Milestones
 
