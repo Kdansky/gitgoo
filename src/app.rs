@@ -477,6 +477,15 @@ fn history(ui: &mut egui::Ui, side: &mut Side) -> bool {
             bottom.wrap = wrap;
             painter.galley(rect.min + vec2(6.0, 4.0), painter.layout_job(top), Color32::PLACEHOLDER);
             painter.galley(rect.min + vec2(6.0, 4.0 + line_h), painter.layout_job(bottom), Color32::PLACEHOLDER);
+            resp.on_hover_ui(|ui| {
+                // Messages are wrapped for a 72-column terminal; egui's default tooltip width would wrap them again.
+                ui.set_max_width(80.0 * ui.ctx().fonts_mut(|f| f.glyph_width(&mono, '0')));
+                ui.label(egui::RichText::new(&c.subject).strong());
+                if !c.body.is_empty() {
+                    ui.label(egui::RichText::new(&c.body).monospace());
+                }
+                ui.weak(format!("{} · {}", c.author, c.date));
+            });
         }
         rows.end
     });
@@ -604,6 +613,22 @@ mod tests {
             shot(&mut h, name);
             assert_eq!(h.state().mode, mode);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn hovering_a_commit_shows_its_whole_message() {
+        let dir = git::tests::repo("ui-hover", &["one"]);
+        let subject = "Keep the second commit, which the narrow column cuts short";
+        // Wrapped at 72 columns, as git messages are, so the shot shows whether the tooltip wraps it again.
+        let body = "The first line of the body runs right up to the seventy-two column mark\nand carries on below.\n\n- a list item\n- another one";
+        git::tests::run(&dir, &["commit", "-q", "--allow-empty", "-m", subject, "-m", body]);
+        let mut h = Harness::builder().with_size([1600.0, 500.0]).build_eframe(|cc| App::new(cc, Some(dir.clone())));
+        wait(&mut h, |h| h.query_all_by_label(subject).count() == 2);
+        assert!(h.query_by_label(body).is_none());
+        h.get_all_by_label(subject).next().unwrap().hover();
+        wait(&mut h, |h| h.query_by_label(body).is_some());
+        shot(&mut h, "message");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -12,7 +12,7 @@ Five columns:
 |---|---|---|---|---|
 | history, left | history, right | changed files | files at A | files at B |
 
-- **A, B**: a branch's commits, newest first. The branch name heads the column; clicking it opens the branch picker.
+- **A, B**: a branch's commits, newest first. The branch name heads the column; clicking it opens the branch picker. Hovering a commit shows its whole message, author and date.
 - **C**: files that differ between the commits picked in A and B, with status and +/− line counts. Clicking one brings it to the top of D and E. The file at the top is the one marked, so the mark follows the reader.
 - **D, E**: every file that differs, one after another, as in GitLab's compare view: side by side, aligned, scrolling together. Each file starts with a header row naming it, with its line counts. The old file is always A's commit, on the left; the new one B's. Above the columns, each side names the file at the top and its commit.
 

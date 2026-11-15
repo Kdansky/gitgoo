@@ -11,7 +11,11 @@ pub struct Commit {
     pub author: String,
     /// Relative, as git words it: "3 days ago".
     pub when: String,
+    /// "2026-11-15 14:03:22 +0100", on the author's clock.
+    pub date: String,
     pub subject: String,
+    /// The message after the subject; often empty.
+    pub body: String,
 }
 
 pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
@@ -103,12 +107,13 @@ pub fn head(repo: &Path) -> String {
 /// `n` commits reachable from `rev`, newest first, after skipping `skip`.
 pub fn log(repo: &Path, rev: &str, skip: usize, n: usize) -> Result<Vec<Commit>> {
     let (skip, n) = (format!("--skip={skip}"), format!("-n{n}"));
-    let out = git(repo, &["log", "-z", "--format=%H%x1f%an%x1f%ar%x1f%s", &skip, &n, rev, "--"])?;
+    let out = git(repo, &["log", "-z", "--format=%H%x1f%an%x1f%ar%x1f%ai%x1f%s%x1f%b", &skip, &n, rev, "--"])?;
     Ok(out
         .split('\0')
         .filter_map(|rec| {
-            let mut f = rec.splitn(4, '\x1f');
-            Some(Commit { id: f.next()?.into(), author: f.next()?.into(), when: f.next()?.into(), subject: f.next()?.into() })
+            let mut f = rec.splitn(6, '\x1f').map(str::to_owned);
+            let (id, author, when, date, subject) = (f.next()?, f.next()?, f.next()?, f.next()?, f.next()?);
+            Some(Commit { id, author, when, date, subject, body: f.next()?.trim_end().into() })
         })
         .collect())
 }
@@ -237,11 +242,15 @@ pub(crate) mod tests {
     #[test]
     fn log_pages_newest_first() {
         let dir = repo("log", &["one", "two", "three"]);
+        run(&dir, &["commit", "-q", "--allow-empty", "-m", "four", "-m", "Why.\n\n- a\n- b\n"]);
         let all = log(&dir, "main", 0, 10).unwrap();
-        assert_eq!(all.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(), ["three", "two", "one"]);
+        assert_eq!(all.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(), ["four", "three", "two", "one"]);
         assert_eq!(all[0].author, "Tester");
         assert_eq!(all[0].id.len(), 40);
-        let page = log(&dir, "main", 1, 1).unwrap();
+        assert_eq!(all[0].body, "Why.\n\n- a\n- b");
+        assert_eq!(all[1].body, "");
+        assert!(all[0].date.starts_with("20"), "{}", all[0].date);
+        let page = log(&dir, "main", 2, 1).unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].subject, "two");
         std::fs::remove_dir_all(dir).unwrap();

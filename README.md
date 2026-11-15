@@ -16,7 +16,7 @@ To remove it: `rm ~/.local/bin/gitgoo ~/.local/share/applications/gitgoo.desktop
 
 Start the application and pick a repository folder, or run `gitgoo path/to/repo`. Repositories opened before are listed on the start screen and behind the toolbar's "Open recent".
 
-- **First and second column**: two commit histories. The branch name above each opens a map of the branches, drawn leaving and rejoining main; click one to switch.
+- **First and second column**: two commit histories. Hover a commit for its whole message. The branch name above each opens a map of the branches, drawn leaving and rejoining main; click one to switch.
 - **List of files**: the files that differ between the commits picked in A and B, with line counts. Clicking one jumps to it.
 - **Two columns of text**: every file that differs, one after another, old (A) on the left and new (B) on the right, with changed words marked.
 
